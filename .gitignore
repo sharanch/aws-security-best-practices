@@ -1,0 +1,22 @@
+# AWS credentials — never commit these
+.env
+.env.*
+*.pem
+*.key
+credentials
+aws-credentials*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Audit output files
+audit-*.txt
+audit-*.log
+/tmp/
