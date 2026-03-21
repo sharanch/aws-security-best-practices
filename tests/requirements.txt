@@ -1,0 +1,10 @@
+# Test dependencies for running audit scripts against moto
+# Do NOT install globally — use the venv managed by test-all.sh
+#
+# Manual setup if needed:
+#   python3 -m venv tests/.venv
+#   source tests/.venv/bin/activate
+#   pip install -r tests/requirements.txt
+
+moto[server,iam,ec2,s3,rds,lambda]>=4.2.0
+boto3>=1.28.0

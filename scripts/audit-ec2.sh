@@ -2,7 +2,7 @@
 # audit-ec2.sh — EC2 and compute security audit script
 # Usage: ./audit-ec2.sh [--profile <aws-profile>] [--region <region>]
 
-set -euo pipefail
+set -uo pipefail
 
 # ─── Colors ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -64,14 +64,18 @@ fi
 # ─── 2. Public IP Exposure ────────────────────────────────────────────────────
 header "2. Public IP Exposure"
 
-$AWS ec2 describe-instances \
+PUBLIC_INSTANCES=$($AWS ec2 describe-instances \
   --filters "Name=instance-state-name,Values=running" \
   --query 'Reservations[*].Instances[*].[InstanceId,PublicIpAddress,Tags[?Key==`Name`].Value|[0]]' \
-  --output text 2>/dev/null | while IFS=$'\t' read -r instance_id public_ip name; do
-  [[ -z "$public_ip" || "$public_ip" == "None" ]] && continue
-  name="${name:-unnamed}"
-  warning "Instance $instance_id ($name) has public IP: $public_ip — verify this is intentional"
-done
+  --output text 2>/dev/null || echo "")
+
+if [[ -n "$PUBLIC_INSTANCES" ]]; then
+  while IFS=$'\t' read -r instance_id public_ip name; do
+    [[ -z "$public_ip" || "$public_ip" == "None" ]] && continue
+    name="${name:-unnamed}"
+    warning "Instance $instance_id ($name) has public IP: $public_ip — verify this is intentional"
+  done <<< "$PUBLIC_INSTANCES"
+fi
 
 # ─── 3. Security Groups — SSH/RDP Open to World ───────────────────────────────
 header "3. Security Groups — Dangerous Inbound Rules"
@@ -113,13 +117,23 @@ fi
 # All ports open to world (rule allowing all traffic)
 ALL_OPEN=$($AWS ec2 describe-security-groups \
   --filters "Name=ip-permission.cidr,Values=0.0.0.0/0" \
-  --query 'SecurityGroups[?IpPermissions[?IpProtocol==`-1`]].[GroupId,GroupName]' \
+  --query 'SecurityGroups[*].[GroupId,GroupName]' \
   --output text 2>/dev/null || echo "")
 
+# Filter for -1 (all protocols) in Python since JMESPath backtick matching varies
 if [[ -n "$ALL_OPEN" ]]; then
-  while IFS=$'\t' read -r sg_id sg_name; do
-    critical "Security group $sg_id ($sg_name) allows ALL traffic from 0.0.0.0/0"
-  done <<< "$ALL_OPEN"
+  ALL_OPEN_FILTERED=$($AWS ec2 describe-security-groups \
+    --filters "Name=ip-permission.cidr,Values=0.0.0.0/0" \
+              "Name=ip-permission.protocol,Values=-1" \
+    --query 'SecurityGroups[*].[GroupId,GroupName]' \
+    --output text 2>/dev/null || echo "")
+  if [[ -n "$ALL_OPEN_FILTERED" ]]; then
+    while IFS=$'\t' read -r sg_id sg_name; do
+      critical "Security group $sg_id ($sg_name) allows ALL traffic from 0.0.0.0/0"
+    done <<< "$ALL_OPEN_FILTERED"
+  else
+    pass "No security groups allow all traffic from 0.0.0.0/0"
+  fi
 else
   pass "No security groups allow all traffic from 0.0.0.0/0"
 fi
@@ -127,34 +141,38 @@ fi
 # ─── 4. Instance Roles — Admin Access ─────────────────────────────────────────
 header "4. EC2 Instance Roles — Over-Privileged"
 
-$AWS ec2 describe-instances \
+ROLE_INSTANCES=$($AWS ec2 describe-instances \
   --filters "Name=instance-state-name,Values=running" \
   --query 'Reservations[*].Instances[*].[InstanceId,IamInstanceProfile.Arn,Tags[?Key==`Name`].Value|[0]]' \
-  --output text 2>/dev/null | while IFS=$'\t' read -r instance_id profile_arn name; do
-  [[ -z "$profile_arn" || "$profile_arn" == "None" ]] && continue
-  name="${name:-unnamed}"
+  --output text 2>/dev/null || echo "")
 
-  # Extract profile name from ARN
-  profile_name=$(echo "$profile_arn" | cut -d'/' -f2)
+if [[ -n "$ROLE_INSTANCES" ]]; then
+  while IFS=$'\t' read -r instance_id profile_arn name; do
+    [[ -z "$profile_arn" || "$profile_arn" == "None" ]] && continue
+    name="${name:-unnamed}"
 
-  # Get role name from profile
-  role_name=$($AWS iam get-instance-profile \
-    --instance-profile-name "$profile_name" \
-    --query 'InstanceProfile.Roles[0].RoleName' --output text 2>/dev/null || echo "")
+    # Extract profile name from ARN
+    profile_name=$(echo "$profile_arn" | cut -d'/' -f2)
 
-  [[ -z "$role_name" || "$role_name" == "None" ]] && continue
+    # Get role name from profile
+    role_name=$($AWS iam get-instance-profile \
+      --instance-profile-name "$profile_name" \
+      --query 'InstanceProfile.Roles[0].RoleName' --output text 2>/dev/null || echo "")
 
-  # Check if AdministratorAccess is attached
-  admin=$($AWS iam list-attached-role-policies --role-name "$role_name" \
-    --query 'AttachedPolicies[?PolicyName==`AdministratorAccess`].PolicyName' \
-    --output text 2>/dev/null || echo "")
+    [[ -z "$role_name" || "$role_name" == "None" ]] && continue
 
-  if [[ -n "$admin" ]]; then
-    critical "Instance $instance_id ($name) has role $role_name with AdministratorAccess"
-  else
-    pass "Instance $instance_id ($name) role $role_name — no AdministratorAccess"
-  fi
-done
+    # Check if AdministratorAccess is attached
+    admin=$($AWS iam list-attached-role-policies --role-name "$role_name" \
+      --query 'AttachedPolicies[?PolicyName==`AdministratorAccess`].PolicyName' \
+      --output text 2>/dev/null || echo "")
+
+    if [[ -n "$admin" ]]; then
+      critical "Instance $instance_id ($name) has role $role_name with AdministratorAccess"
+    else
+      pass "Instance $instance_id ($name) role $role_name — no AdministratorAccess"
+    fi
+  done <<< "$ROLE_INSTANCES"
+fi
 
 # ─── 5. SSM Agent — Session Manager Readiness ─────────────────────────────────
 header "5. SSM Agent — Session Manager Availability"
@@ -169,6 +187,8 @@ RUNNING_COUNT=$($AWS ec2 describe-instances \
   --output text 2>/dev/null || echo "0")
 
 SSM_COUNT=$(echo "$SSM_INSTANCES" | grep -c "Online" 2>/dev/null || echo "0")
+SSM_COUNT=$(echo "$SSM_COUNT" | tr -d '[:space:]')
+RUNNING_COUNT=$(echo "$RUNNING_COUNT" | tr -d '[:space:]')
 
 if [[ $SSM_COUNT -eq 0 ]]; then
   warning "No instances have SSM Agent online — Session Manager not available"

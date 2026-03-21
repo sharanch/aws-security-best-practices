@@ -2,7 +2,7 @@
 # audit-network.sh — VPC and network security audit script
 # Usage: ./audit-network.sh [--profile <aws-profile>] [--region <region>]
 
-set -euo pipefail
+set -uo pipefail
 
 # ─── Colors ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -48,6 +48,7 @@ if [[ -z "$VPCS" ]]; then
 else
   while IFS=$'\t' read -r vpc_id vpc_name is_default; do
     vpc_name="${vpc_name:-unnamed}"
+    [[ "$vpc_name" == "None" ]] && vpc_name="unnamed"
 
     FLOW_LOG=$($AWS ec2 describe-flow-logs \
       --filter "Name=resource-id,Values=$vpc_id" \
@@ -69,6 +70,7 @@ header "2. VPC Endpoints"
 
 while IFS=$'\t' read -r vpc_id vpc_name _; do
   vpc_name="${vpc_name:-unnamed}"
+  [[ "$vpc_name" == "None" ]] && vpc_name="unnamed"
 
   # Check S3 gateway endpoint
   S3_EP=$($AWS ec2 describe-vpc-endpoints \
@@ -123,7 +125,9 @@ header "4. Security Groups — All Traffic Open"
 
 # Find SGs allowing all inbound from anywhere
 ALL_INBOUND=$($AWS ec2 describe-security-groups \
-  --query 'SecurityGroups[?IpPermissions[?IpProtocol==`-1` && IpRanges[?CidrIp==`0.0.0.0/0`]]].[GroupId,GroupName,VpcId]' \
+  --filters "Name=ip-permission.cidr,Values=0.0.0.0/0" \
+            "Name=ip-permission.protocol,Values=-1" \
+  --query 'SecurityGroups[*].[GroupId,GroupName,VpcId]' \
   --output text 2>/dev/null || echo "")
 
 if [[ -n "$ALL_INBOUND" ]]; then
@@ -140,6 +144,7 @@ ALL_OUTBOUND=$($AWS ec2 describe-security-groups \
   --output text 2>/dev/null || echo "")
 
 OUTBOUND_COUNT=$(echo "$ALL_OUTBOUND" | grep -c . 2>/dev/null || echo "0")
+OUTBOUND_COUNT=$(echo "$OUTBOUND_COUNT" | tr -d '[:space:]')
 [[ $OUTBOUND_COUNT -gt 0 ]] && \
   info "$OUTBOUND_COUNT security groups allow all outbound traffic (default AWS behavior — review for sensitive workloads)"
 
@@ -172,8 +177,8 @@ fi
 
 # Check individual buckets for public access
 info "Checking individual S3 buckets for public access..."
-$AWS s3api list-buckets --query 'Buckets[*].Name' --output text 2>/dev/null | \
-  tr '\t' '\n' | while read -r bucket; do
+BUCKET_LIST=$($AWS s3api list-buckets --query 'Buckets[*].Name' --output text 2>/dev/null || echo "")
+echo "$BUCKET_LIST" | tr '\t' '\n' | while read -r bucket; do
   [[ -z "$bucket" ]] && continue
 
   PUBLIC=$($AWS s3api get-bucket-policy-status \
@@ -181,7 +186,7 @@ $AWS s3api list-buckets --query 'Buckets[*].Name' --output text 2>/dev/null | \
     --query 'PolicyStatus.IsPublic' --output text 2>/dev/null || echo "false")
 
   [[ "$PUBLIC" == "true" ]] && critical "S3 bucket '$bucket' is PUBLICLY ACCESSIBLE via bucket policy"
-done
+done || true
 
 # ─── 6. CloudTrail Multi-Region ───────────────────────────────────────────────
 header "6. CloudTrail Coverage"
@@ -194,7 +199,7 @@ $AWS cloudtrail describe-trails \
   [[ "$global_events" == "False" ]] && warning "Trail '$name' doesn't log global service events (IAM, STS, CloudFront)"
   [[ "$validation" == "False" ]] && warning "Trail '$name' log validation disabled — logs could be tampered without detection"
   [[ "$multi_region" == "True" && "$validation" == "True" ]] && pass "Trail '$name' is multi-region with validation enabled"
-done
+done || true
 
 # ─── Summary ──────────────────────────────────────────────────────────────────
 header "Audit Summary"

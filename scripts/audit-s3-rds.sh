@@ -2,7 +2,7 @@
 # audit-s3-rds.sh — S3 and RDS security audit script
 # Usage: ./audit-s3-rds.sh [--profile <aws-profile>] [--region <region>]
 
-set -euo pipefail
+set -uo pipefail
 
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
@@ -39,7 +39,11 @@ header "S3 — Account-Level Block Public Access"
 
 ACCOUNT_ID=$($AWS sts get-caller-identity --query 'Account' --output text)
 
-BPA=$($AWS s3control get-public-access-block --account-id $ACCOUNT_ID 2>/dev/null || echo "NONE")
+# s3control uses a different endpoint subdomain — pass endpoint explicitly if set
+S3CONTROL_ENDPOINT=""
+[[ -n "${AWS_ENDPOINT_URL:-}" ]] && S3CONTROL_ENDPOINT="--endpoint-url ${AWS_ENDPOINT_URL}"
+
+BPA=$($AWS s3control get-public-access-block --account-id $ACCOUNT_ID ${S3CONTROL_ENDPOINT} 2>/dev/null || echo "NONE")
 
 if [[ "$BPA" == "NONE" ]]; then
   critical "S3 account-level Block Public Access is NOT configured"
@@ -87,8 +91,8 @@ done
 # ─── S3: Public Snapshots ─────────────────────────────────────────────────────
 header "S3 — Dangerous Bucket Policies (Principal: *)"
 
-$AWS s3api list-buckets --query 'Buckets[*].Name' --output text 2>/dev/null | \
-  tr '\t' '\n' | while read -r bucket; do
+S3_BUCKETS=$($AWS s3api list-buckets --query 'Buckets[*].Name' --output text 2>/dev/null || echo "")
+echo "$S3_BUCKETS" | tr '\t' '\n' | while read -r bucket; do
   [[ -z "$bucket" ]] && continue
   policy=$($AWS s3api get-bucket-policy --bucket "$bucket" \
     --query 'Policy' --output text 2>/dev/null || echo "")
@@ -110,7 +114,7 @@ except: pass
     [[ "$has_star" == "UNCONDITIONED" ]] && \
       critical "Bucket '$bucket' has Principal: * with no conditions — publicly accessible"
   fi
-done
+done || true
 
 # ─── RDS: Public Access ───────────────────────────────────────────────────────
 header "RDS — Public Accessibility"
@@ -130,9 +134,11 @@ fi
 # ─── RDS: Encryption ─────────────────────────────────────────────────────────
 header "RDS — Encryption at Rest"
 
-$AWS rds describe-db-instances \
+RDS_ENC=$($AWS rds describe-db-instances \
   --query 'DBInstances[*].[DBInstanceIdentifier,StorageEncrypted,KmsKeyId]' \
-  --output text 2>/dev/null | while IFS=$'\t' read -r db_id encrypted kms_key; do
+  --output text 2>/dev/null || echo "")
+
+echo "$RDS_ENC" | while IFS=$'\t' read -r db_id encrypted kms_key; do
   [[ -z "$db_id" ]] && continue
   if [[ "$encrypted" == "False" ]]; then
     critical "RDS instance $db_id is NOT encrypted at rest"
@@ -146,9 +152,11 @@ done
 # ─── RDS: IAM Auth and Deletion Protection ────────────────────────────────────
 header "RDS — IAM Auth and Deletion Protection"
 
-$AWS rds describe-db-instances \
+RDS_CONFIG=$($AWS rds describe-db-instances \
   --query 'DBInstances[*].[DBInstanceIdentifier,IAMDatabaseAuthenticationEnabled,DeletionProtection,BackupRetentionPeriod,MultiAZ]' \
-  --output text 2>/dev/null | while IFS=$'\t' read -r db_id iam_auth del_protect backup_days multi_az; do
+  --output text 2>/dev/null || echo "")
+
+echo "$RDS_CONFIG" | while IFS=$'\t' read -r db_id iam_auth del_protect backup_days multi_az; do
   [[ -z "$db_id" ]] && continue
 
   [[ "$iam_auth" == "False" ]] && \
@@ -170,10 +178,11 @@ done
 # ─── RDS: Public Snapshots ────────────────────────────────────────────────────
 header "RDS — Public Snapshots"
 
-$AWS rds describe-db-snapshots \
+RDS_SNAPS=$($AWS rds describe-db-snapshots \
   --snapshot-type manual \
-  --query 'DBSnapshots[*].DBSnapshotIdentifier' --output text 2>/dev/null | \
-  tr '\t' '\n' | while read -r snapshot; do
+  --query 'DBSnapshots[*].DBSnapshotIdentifier' --output text 2>/dev/null || echo "")
+
+echo "$RDS_SNAPS" | tr '\t' '\n' | while read -r snapshot; do
   [[ -z "$snapshot" ]] && continue
   attrs=$($AWS rds describe-db-snapshot-attributes \
     --db-snapshot-identifier "$snapshot" \

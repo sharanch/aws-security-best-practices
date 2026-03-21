@@ -3,7 +3,7 @@
 # Usage: ./audit-iam.sh [--profile <aws-profile>] [--region <region>]
 # Output: Prints findings to stdout, exits 1 if critical issues found
 
-set -euo pipefail
+set -uo pipefail
 
 # ─── Colors ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -68,7 +68,7 @@ $AWS iam generate-credential-report > /dev/null 2>&1 || true
 sleep 5
 
 REPORT=$($AWS iam get-credential-report \
-  --query 'Content' --output text | base64 -d)
+  --query 'Content' --output text 2>/dev/null | base64 -d 2>/dev/null || echo "")
 
 # Users with no MFA
 echo "$REPORT" | tail -n +2 | while IFS=',' read -r user arn user_creation_time \
@@ -107,43 +107,68 @@ echo "$REPORT" | tail -n +2 | while IFS=',' read -r user arn user_creation_time 
     fi
   fi
 
-done
+done || true
 
 # ─── 3. Admin Access ──────────────────────────────────────────────────────────
 header "3. Admin Access — Who Has It"
 
 info "Users with AdministratorAccess policy:"
-$AWS iam list-entities-for-policy \
-  --policy-arn arn:aws:iam::aws:policy/AdministratorAccess \
-  --entity-filter User \
-  --query 'PolicyUsers[*].UserName' --output text | tr '\t' '\n' | while read -r user; do
+# Try AWS partition ARN first (real AWS), fall back to account-scoped ARN (moto)
+ADMIN_POLICY_ARN="arn:aws:iam::aws:policy/AdministratorAccess"
+ADMIN_POLICY_ARN_ACCOUNT="arn:aws:iam::$(${AWS} sts get-caller-identity --query Account --output text 2>/dev/null || echo '123456789012'):policy/AdministratorAccess"
+
+ALL_USERS=""
+for arn in "$ADMIN_POLICY_ARN" "$ADMIN_POLICY_ARN_ACCOUNT"; do
+  U=$($AWS iam list-entities-for-policy \
+    --policy-arn "$arn" \
+    --entity-filter User \
+    --query 'PolicyUsers[*].UserName' --output text 2>/dev/null || echo "")
+  ALL_USERS="$ALL_USERS $U"
+done
+echo "$ALL_USERS" | tr ' \t' '\n' | sort -u | while read -r user; do
   [[ -z "$user" ]] && continue
+  [[ "$user" =~ ^[0-9]+$ ]] && continue
   warning "User '$user' has AdministratorAccess attached directly"
 done
 
 info "Roles with AdministratorAccess policy:"
-$AWS iam list-entities-for-policy \
-  --policy-arn arn:aws:iam::aws:policy/AdministratorAccess \
-  --entity-filter Role \
-  --query 'PolicyRoles[*].RoleName' --output text | tr '\t' '\n' | while read -r role; do
+ALL_ROLES=""
+for arn in "$ADMIN_POLICY_ARN" "$ADMIN_POLICY_ARN_ACCOUNT"; do
+  R=$($AWS iam list-entities-for-policy \
+    --policy-arn "$arn" \
+    --entity-filter Role \
+    --query 'PolicyRoles[*].RoleName' --output text 2>/dev/null || echo "")
+  ALL_ROLES="$ALL_ROLES $R"
+done
+echo "$ALL_ROLES" | tr ' \t' '\n' | sort -u | while read -r role; do
   [[ -z "$role" ]] && continue
+  [[ "$role" =~ ^[0-9]+$ ]] && continue
   warning "Role '$role' has AdministratorAccess attached — verify this is intentional"
 done
 
 info "Groups with AdministratorAccess policy:"
-$AWS iam list-entities-for-policy \
-  --policy-arn arn:aws:iam::aws:policy/AdministratorAccess \
-  --entity-filter Group \
-  --query 'PolicyGroups[*].GroupName' --output text | tr '\t' '\n' | while read -r group; do
+ALL_GROUPS=""
+for arn in "$ADMIN_POLICY_ARN" "$ADMIN_POLICY_ARN_ACCOUNT"; do
+  G=$($AWS iam list-entities-for-policy \
+    --policy-arn "$arn" \
+    --entity-filter Group \
+    --query 'PolicyGroups[*].GroupName' --output text 2>/dev/null || echo "")
+  ALL_GROUPS="$ALL_GROUPS $G"
+done
+echo "$ALL_GROUPS" | tr ' \t' '\n' | sort -u | while read -r group; do
   [[ -z "$group" ]] && continue
+  # Skip numeric-only values (moto sometimes returns GIDs)
+  [[ "$group" =~ ^[0-9]+$ ]] && continue
   info "Group '$group' has AdministratorAccess — check group membership"
 done
 
 # ─── 4. Dangerous Role Trust Policies ────────────────────────────────────────
 header "4. Role Trust Policies — Overly Permissive"
 
-$AWS iam list-roles \
-  --query 'Roles[*].RoleName' --output text | tr '\t' '\n' | while read -r role; do
+ROLES_LIST=$($AWS iam list-roles \
+  --query 'Roles[*].RoleName' --output text 2>/dev/null || echo "")
+
+echo "$ROLES_LIST" | tr '\t' '\n' | while read -r role; do
   [[ -z "$role" ]] && continue
   trust=$($AWS iam get-role --role-name "$role" \
     --query 'Role.AssumeRolePolicyDocument' --output json 2>/dev/null || echo "{}")

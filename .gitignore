@@ -6,6 +6,12 @@
 credentials
 aws-credentials*
 
+# Python venv
+tests/.venv/
+.venv/
+__pycache__/
+*.pyc
+
 # OS
 .DS_Store
 Thumbs.db
